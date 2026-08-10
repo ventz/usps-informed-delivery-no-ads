@@ -1,0 +1,19 @@
+{
+  "version": "2.0",
+  "app_name": "usps",
+  "environment_variables": {
+    "OPENAI_API_KEY": "sk-proj-REPLACE-ME",
+    "OPENAI_MODEL": "gpt-5.6-sol",
+    "APP_BUCKET_NAME": "usps-ai-email-<AWS_ACCOUNT_ID>",
+    "DIGEST_TO": "you@yourmail.tld",
+    "DIGEST_FROM": "no-reply@domainViaSES.tld"
+  },
+  "stages": {
+    "dev": {
+      "api_gateway_stage": "api",
+      "autogen_policy": false,
+      "lambda_memory_size": 512,
+      "lambda_timeout": 300
+    }
+  }
+}

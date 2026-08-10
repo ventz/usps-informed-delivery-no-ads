@@ -1,0 +1,22 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Generated / transient
+# samples/ — synthetic fixtures, rebuild with: uv run tools/make_fixture.py
+# out/ — rendered HTML previews from tools/test_local.py
+# requirements.txt — exported from uv.lock by tools/deploy.sh; uv is the source of truth
+samples/
+out/
+requirements.txt
+
+# Private engineering notes — not part of the public release
+CLAUDE.md
+
+# Contains OPENAI_API_KEY in plaintext — see .chalice/config.json.example
+.chalice/config.json
+.chalice/deployed/
+.chalice/deployments/
+.DS_Store
