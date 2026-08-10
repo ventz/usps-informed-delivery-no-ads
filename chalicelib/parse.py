@@ -153,28 +153,25 @@ def html_to_lines(html: str) -> list[str]:
     return _rejoin_fragments([c for c in (_clean(ln) for ln in raw.split("\n")) if c])
 
 
-def map_cid_senders(html: str) -> dict[str, str]:
-    """Map each inline image's Content-ID to the `FROM:` label above it.
+#: A mailpiece occupies its own `div`, whose id names the kind of piece:
+#: `mail-campaign` (targeted campaign), `sat-campaign` (saturation ride-along),
+#: `sg-mailpiece` (plain piece, no advertiser). The band wrappers around them
+#: are `td`s ending in `-div-id`, so matching a `div` id by suffix picks out
+#: exactly the per-piece blocks and never the band.
+MAILPIECE_BLOCK_SUFFIXES = ("campaign", "mailpiece")
 
-    A campaign mailpiece that supplies no replacement image falls back to the
-    REAL grayscale scan, rendered directly beneath its `FROM:` heading (observed
-    8/6: the financial sender's block contains 2989542530-068.jpg). So USPS states the
-    sender in the markup — asking the vision model to infer it from an anonymous
-    PO Box was guessing at something already known.
 
-    This walks document order, so the nearest preceding FROM: wins. It is the
-    one place structural HTML reading beats text parsing, because the
-    image->sender association is positional and vanishes in flattened text.
-    """
-    soup = BeautifulSoup(html, "html.parser")
-    for tag in soup(["script", "style"]):
-        tag.decompose()
+def is_mailpiece_block(tag: object) -> bool:
+    return (
+        getattr(tag, "name", None) == "div"
+        and (tag.get("id") or "").strip().lower().endswith(MAILPIECE_BLOCK_SUFFIXES)
+    )
 
-    mapping: dict[str, str] = {}
-    last_from: str | None = None
+
+def _sender_image_events(node):
+    """Yield ('from', name) / ('img', cid) in document order beneath `node`."""
     awaiting_name = False
-
-    for el in soup.descendants:
+    for el in node.descendants:
         if isinstance(el, NavigableString):
             text = _clean(str(el))
             if not text:
@@ -182,15 +179,78 @@ def map_cid_senders(html: str) -> dict[str, str]:
             if text.startswith("FROM:"):
                 rest = text[len("FROM:") :].strip()
                 if rest:
-                    last_from, awaiting_name = rest, False
+                    awaiting_name = False
+                    yield "from", rest
                 else:
                     awaiting_name = True  # name lives in a sibling element
             elif awaiting_name:
-                last_from, awaiting_name = text, False
+                awaiting_name = False
+                yield "from", text
         elif getattr(el, "name", None) == "img":
             src = (el.get("src") or "").strip()
-            if src.lower().startswith("cid:") and last_from:
-                mapping[src[4:].strip().strip("<>")] = last_from
+            if src.lower().startswith("cid:"):
+                yield "img", src[4:].strip().strip("<>")
+
+
+def _map_by_document_order(soup) -> dict[str, str]:
+    """Legacy fallback: nearest preceding FROM: wins.
+
+    Only correct when every image really does sit under a FROM: heading. Used
+    when the markup carries no recognisable per-piece blocks at all, where a
+    positional guess still beats no sender.
+    """
+    mapping: dict[str, str] = {}
+    last_from: str | None = None
+    for kind, value in _sender_image_events(soup):
+        if kind == "from":
+            last_from = value
+        elif last_from:
+            mapping[value] = last_from
+    return mapping
+
+
+def map_cid_senders(html: str) -> dict[str, str]:
+    """Map each inline image's Content-ID to the `FROM:` label of ITS mailpiece.
+
+    A campaign mailpiece that supplies no replacement image falls back to the
+    REAL grayscale scan, rendered directly beneath its `FROM:` heading (observed
+    8/6: the financial sender's block contains 2989542530-068.jpg). So USPS states the
+    sender in the markup — asking the vision model to infer it from an anonymous
+    PO Box was guessing at something already known.
+
+    The association is scoped to the enclosing per-piece `div`, NOT to document
+    order. A plain `sg-mailpiece` block carries no FROM: at all, so under a
+    document-order walk its scan inherited the previous campaign's advertiser —
+    so a genuine letter was rendered and emailed under an advertiser's name. An
+    image outside every block, or in a block with no FROM:, gets no listed
+    sender and falls through to vision.
+
+    It is the one place structural HTML reading beats text parsing, because the
+    image->sender association is positional and vanishes in flattened text.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style"]):
+        tag.decompose()
+
+    blocks = [
+        b
+        for b in soup.find_all("div")
+        if is_mailpiece_block(b) and not any(is_mailpiece_block(p) for p in b.parents)
+    ]
+    if not blocks:
+        return _map_by_document_order(soup)
+
+    mapping: dict[str, str] = {}
+    for block in blocks:
+        sender: str | None = None
+        cids: list[str] = []
+        for kind, value in _sender_image_events(block):
+            if kind == "from":
+                sender = sender or value
+            else:
+                cids.append(value)
+        if sender:
+            mapping.update(dict.fromkeys(cids, sender))
     return mapping
 
 

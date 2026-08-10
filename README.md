@@ -224,8 +224,10 @@ Two traps worth knowing:
 
 ### Where the sender comes from
 
-Preferred: **parsed from the markup.** USPS renders a scan directly beneath its `FROM:`
-heading, so `parse.map_cid_senders()` maps each image to its sender deterministically.
+Preferred: **parsed from the markup.** USPS gives each mailpiece its own block, and a
+campaign block states its sender in a `FROM:` heading, so `parse.map_cid_senders()` maps
+each image to the sender of *its own* block deterministically. A plain mailpiece block
+has no `FROM:` — it gets no parsed sender rather than borrowing a neighbour's.
 
 Fallback: **vision**, for pieces with no `FROM:` label — where the sender exists only
 inside the JPEG (e.g. an insurer's envelope on 2026-08-07).

@@ -138,6 +138,48 @@ def test_cid_sender_mapping_uses_nearest_preceding_from():
     assert mapping["mailer-1202017988.jpg"] == "save-select homes"  # inline "FROM: x" form
 
 
+def test_plain_mailpiece_does_not_inherit_the_campaign_above_it():
+    """A genuine scan must not be published under the advertiser's name.
+
+    Mirrors the real markup — a `mail-campaign` block with its FROM:, then a
+    `sg-mailpiece` block that carries the genuine scan and NO FROM: at all.
+    Under the old document-order walk the scan inherited "Tea Collection", so a
+    real letter went out labelled as the campaign above it. The scan must stay
+    unlisted and fall through to vision.
+    """
+    html = """
+      <td id="campaign-div-id"><div id="mail-campaign">
+        <p>FROM:</p><p>Tea Collection</p>
+        <img src="cid:mailer-1201999728.jpg"><img src="cid:content-1201999728.jpg"></div></td>
+      <td id="mailpiece-div-id"><div id="sg-mailpiece">
+        <img src="cid:2990275948-068.jpg"></div></td>
+    """
+    mapping = parse.map_cid_senders(html)
+    assert mapping["mailer-1201999728.jpg"] == "Tea Collection"
+    assert "2990275948-068.jpg" not in mapping
+
+
+def test_saturation_campaign_block_is_scoped_too():
+    """`sat-campaign` is a third block kind; its FROM: must not leak outward."""
+    html = """
+      <div id="sg-mailpiece"><img src="cid:2989868880-068.jpg"></div>
+      <div id="sat-campaign">FROM: save-select homes
+        <img src="cid:mailer-1202017988.jpg"></div>
+    """
+    mapping = parse.map_cid_senders(html)
+    assert mapping == {"mailer-1202017988.jpg": "save-select homes"}
+
+
+def test_campaign_block_keeps_its_own_fallback_scan():
+    """The 8/6 shape must still resolve: no replacement image, so the campaign
+    block contains the REAL scan plus an orphan ride-along ad."""
+    html = """
+      <div id="mail-campaign"><span>FROM:</span><span>Example Bank</span>
+        <img src="cid:2989542530-068.jpg"><img src="cid:content-1201908387.jpg"></div>
+    """
+    assert parse.map_cid_senders(html)["2989542530-068.jpg"] == "Example Bank"
+
+
 def test_listed_sender_overrides_vision_in_render():
     d = load("2026-07-10")
     for scan in d.scans:
