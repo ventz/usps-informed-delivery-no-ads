@@ -16,10 +16,14 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from html import escape
 
+
 BG = "#f4f5f7"
 CARD = "#ffffff"
 INK = "#1c1e21"
-MUTED = "#6b7280"
+# #6b7280 was 4.43:1 on BG — below the 4.5:1 AA floor for the section titles and
+# footer, which sit on the page background rather than on a card. #5b6270 is
+# 5.62:1 on BG and 6.13:1 on CARD, and still reads as clearly secondary to INK.
+MUTED = "#5b6270"
 BORDER = "#e5e7eb"
 ACCENT = "#1a4d8f"
 WARN_BG = "#fff8e6"
@@ -61,22 +65,28 @@ def _plural(n: int, word: str) -> str:
 def _chip(text: str, fg: str, bg: str) -> str:
     return (
         f'<span style="display:inline-block;padding:2px 8px;margin:0 6px 0 0;'
-        f'font-size:11px;font-weight:600;letter-spacing:.02em;text-transform:uppercase;'
+        f'font-size:12px;font-weight:600;letter-spacing:.02em;text-transform:uppercase;'
         f'color:{fg};background:{bg};border-radius:10px;">{escape(text)}</span>'
     )
 
 
 def _section_title(text: str) -> str:
+    # A real <h2>: Gmail, Apple Mail and Outlook.com all strip <style> blocks and
+    # ARIA but PRESERVE heading tags, so headings are the only structural
+    # semantics that survive into a mail body — and the only way to skim a
+    # multi-card digest with a screen reader. `margin:0` because client UA
+    # defaults would otherwise wreck the spacing.
     return (
-        f'<tr><td style="padding:26px 24px 8px 24px;font:600 12px {FONT};'
-        f'letter-spacing:.08em;text-transform:uppercase;color:{MUTED};">{escape(text)}</td></tr>'
+        f'<tr><td style="padding:26px 24px 8px 24px;">'
+        f'<h2 style="margin:0;font:600 13px {FONT};letter-spacing:.08em;'
+        f'text-transform:uppercase;color:{MUTED};">{escape(text)}</h2></td></tr>'
     )
 
 
 def _package_row(pkg) -> str:
     sender = escape(pkg.sender or "Unknown sender")
     lines = [
-        f'<div style="font:600 15px {FONT};color:{INK};">{sender}</div>'
+        f'<h3 style="margin:0;font:600 15px {FONT};color:{INK};">{sender}</h3>'
     ]
     meta = []
     if pkg.status:
@@ -85,15 +95,24 @@ def _package_row(pkg) -> str:
         meta.append(escape(pkg.eta))
     if meta:
         lines.append(
-            f'<div style="font:400 13px {FONT};color:{ACCENT};margin-top:3px;">'
+            f'<div style="font:400 14px {FONT};color:{ACCENT};margin-top:3px;">'
             f'{" · ".join(meta)}</div>'
         )
     if pkg.tracking:
         lines.append(
+            # Was MUTED with a 1.24:1 dotted border — nothing marked it as a
+            # link. No :hover or :focus is expressible inline, so the static
+            # affordance is the only affordance an email link ever gets.
+            #
+            # "Track" carries the link purpose in visible text: a bare 22-digit
+            # number says nothing out of context, and title/aria-label are both
+            # stripped by Gmail. inline-block padding lifts the tap target from
+            # ~15px to ~27px.
             f'<div style="margin-top:4px;"><a href="{TRACKING_URL.format(escape(pkg.tracking))}" '
-            f'style="font:400 12px ui-monospace,SFMono-Regular,Menlo,monospace;'
-            f'color:{MUTED};text-decoration:none;border-bottom:1px dotted {BORDER};">'
-            f'{escape(pkg.tracking)}</a></div>'
+            f'style="display:inline-block;padding:6px 0;'
+            f'font:400 13px ui-monospace,SFMono-Regular,Menlo,monospace;'
+            f'color:{ACCENT};text-decoration:underline;">'
+            f'Track {escape(pkg.tracking)}</a></div>'
         )
     return (
         f'<tr><td style="padding:10px 24px;">'
@@ -126,13 +145,13 @@ def _scan_block(scan, cls) -> str:
     summary = ""
     if cls.summary:
         summary = (
-            f'<div style="font:400 13px {FONT};color:{MUTED};margin-top:4px;">'
+            f'<div style="font:400 14px {FONT};color:{MUTED};margin-top:4px;">'
             f'{escape(cls.summary)}</div>'
         )
     recipient = ""
     if cls.recipient:
         recipient = (
-            f'<div style="font:400 12px {FONT};color:{MUTED};margin-top:2px;">'
+            f'<div style="font:400 13px {FONT};color:{MUTED};margin-top:2px;">'
             f'To: {escape(cls.recipient)}</div>'
         )
 
@@ -142,11 +161,14 @@ def _scan_block(scan, cls) -> str:
         f'style="background:{CARD};border:1px solid {BORDER};border-radius:8px;">'
         f'<tr><td style="padding:14px 14px 10px 14px;">'
         f'{type_heading}'
-        f'<div style="font:700 19px {FONT};color:{INK};line-height:1.25;">{sender}</div>'
+        f'<h3 style="margin:0;font:700 19px {FONT};color:{INK};line-height:1.25;">{sender}</h3>'
         f'{summary}{recipient}{action_row}'
         f'</td></tr>'
         f'<tr><td style="padding:0 14px 14px 14px;">'
-        f'<img src="cid:{scan.cid}" alt="Scan of mail from {sender}" width="100%" '
+        # alt identifies the object rather than repeating the sender heading a
+        # screen reader has just read out — and it degrades sanely to something
+        # meaningful instead of "Scan of mail from Unknown sender".
+        f'<img src="cid:{escape(scan.cid)}" alt="USPS envelope scan" width="100%" '
         f'style="display:block;width:100%;max-width:100%;height:auto;'
         f'border:1px solid {BORDER};border-radius:6px;"></td></tr>'
         f'</table></td></tr>'
@@ -186,7 +208,8 @@ def build_html(digest, classifications) -> str:
 
     rows = [
         f'<tr><td style="padding:24px 24px 0 24px;">'
-        f'<div style="font:700 24px {FONT};color:{INK};">{escape(_date_label(digest))}</div>'
+        f'<h1 style="margin:0;font:700 24px {FONT};color:{INK};">'
+        f'{escape(_date_label(digest))}</h1>'
         f'<div style="font:400 14px {FONT};color:{MUTED};margin-top:4px;">'
         f'{_plural(digest.announced_mail, "mailpiece")} · '
         f'{_plural(digest.announced_packages, "package")}</div>'
@@ -225,9 +248,20 @@ def build_html(digest, classifications) -> str:
         '<!doctype html><html lang="en" dir="ltr"><head>'
         '<meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        # Declare the scheme or Gmail/Outlook apply their own PARTIAL inversion:
+        # an ancestor <td> background flips dark while the inline color on its
+        # child does not, giving dark-on-dark. This palette is deliberately light.
+        '<meta name="color-scheme" content="light dark">'
+        '<meta name="supported-color-schemes" content="light dark">'
         f'<title>{escape(subject_for(digest))}</title></head>'
-        f'<body style="margin:0;padding:0;background:{BG};">'
-        f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" '
+        # body sets a background, so it must set a color too — the one-sided
+        # declaration is exactly what forced-dark rewrites against you.
+        f'<body style="margin:0;padding:0;background:{BG};color:{INK};">'
+        # lang/dir repeated on the outermost body element: Gmail and Outlook.com
+        # discard <html>/<head> entirely and re-wrap the body, so the declaration
+        # on the document element doesn't survive where it matters most.
+        f'<table role="presentation" lang="en" dir="ltr" width="100%" '
+        f'cellpadding="0" cellspacing="0" border="0" '
         f'style="background:{BG};padding:20px 0;"><tr><td align="center">'
         f'<table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" '
         f'style="width:600px;max-width:100%;background:{BG};border-radius:12px;">'
@@ -253,9 +287,11 @@ def build_text(digest, classifications) -> str:
     pairs = sorted(zip(digest.scans, classifications), key=lambda p: p[1].sort_key)
     if pairs:
         out.append("MAIL")
-        for _, c in pairs:
+        for s, c in pairs:
             flag = " [action needed]" if c.actionable else ""
-            out.append(f"  - {c.sender} ({c.mail_type}){flag}")
+            # Same precedence as the HTML path: USPS's own FROM: label beats vision.
+            who = getattr(s, "listed_sender", None) or c.sender or "Unknown sender"
+            out.append(f"  - {who} ({c.mail_type}){flag}")
             if c.summary:
                 out.append(f"    {c.summary}")
         out.append("")

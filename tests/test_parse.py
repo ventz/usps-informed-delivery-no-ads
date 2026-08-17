@@ -189,6 +189,12 @@ def test_listed_sender_overrides_vision_in_render():
     assert "Example Bank" in html
     assert "P.O. Box 12345" not in html
 
+    # The text/plain alternative must apply the same precedence — it used to
+    # print the vision guess while the HTML showed USPS's own label.
+    text = render.build_text(d, cls)
+    assert "Example Bank" in text
+    assert "P.O. Box 12345" not in text
+
 
 def test_sender_with_a_scan_is_excluded_from_the_missing_list():
     """The 8/6 shape: Example Bank supplied the scan, so it is NOT 'replaced'."""
@@ -254,6 +260,28 @@ def test_html_is_inline_styled_and_utf8():
     assert "<style" not in html          # Gmail strips <style> unreliably
     assert 'charset="utf-8"' in html
     assert "display:flex" not in html    # no flexbox in email clients
+
+
+def test_html_carries_its_accessibility_semantics():
+    """Pins the a11y work — exactly the kind of thing a refactor reverts silently.
+
+    Headings matter here specifically because Gmail, Apple Mail and Outlook.com
+    strip <style> blocks and ARIA but PRESERVE heading tags, so they are the only
+    structural semantics that survive into a mail body.
+    """
+    d = load("2026-07-10")
+    cls = [classify.Classification(mail_type="bill") for _ in d.scans]
+    html = render.build_html(d, cls)
+
+    assert "<h1 " in html and "<h2 " in html and "<h3 " in html
+    assert "margin:0" in html                      # or client UA defaults wreck spacing
+    assert 'lang="en"' in html and 'dir="ltr"' in html
+    assert html.count('lang="en"') >= 2            # also on the body table: Gmail drops <html>
+    assert 'alt="USPS envelope scan"' in html      # not a duplicate of the sender heading
+    assert "Scan of mail from" not in html
+    assert "#6b7280" not in html                   # failed AA on the page background
+    assert render.MUTED == "#5b6270"
+    assert "text-decoration:none" not in html      # links must look like links
 
 
 def test_subject_summarizes_counts():
