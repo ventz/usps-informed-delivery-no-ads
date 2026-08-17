@@ -9,6 +9,8 @@ Email-client constraints drive every choice here (see CLAUDE.md gotchas):
 
 from __future__ import annotations
 
+import email.policy
+import re
 from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -272,7 +274,11 @@ def build_text(digest, classifications) -> str:
 
 
 def build_message(digest, classifications, sender: str, recipient: str) -> MIMEMultipart:
-    root = MIMEMultipart("related")
+    # policy=SMTP VALIDATES header assignment: any CR/LF in a header value raises
+    # instead of silently emitting a forged header. That permanently forecloses
+    # the injection class that `parse._safe_filename` fixes by hand — including
+    # future headers nobody has thought of yet.
+    root = MIMEMultipart("related", policy=email.policy.SMTP)
     root["Subject"] = subject_for(digest)
     root["From"] = sender
     root["To"] = recipient
@@ -283,7 +289,13 @@ def build_message(digest, classifications, sender: str, recipient: str) -> MIMEM
     root.attach(alt)
 
     for scan in digest.scans:
-        subtype = scan.content_type.split("/", 1)[-1] or "jpeg"
+        # Both of these are spliced into MIME headers, and both originate in the
+        # source email. parse._safe_filename() already strips CR/LF, but the
+        # subtype comes straight off a malformed Content-Type; validate it here
+        # so a crafted part can't forge headers on our outbound message.
+        subtype = scan.content_type.split("/", 1)[-1]
+        if not re.fullmatch(r"[a-z0-9.+-]{1,32}", subtype or ""):
+            subtype = "jpeg"
         img = MIMEImage(scan.data, _subtype=subtype)
         img.add_header("Content-ID", f"<{scan.cid}>")
         img.add_header("Content-Disposition", "inline", filename=scan.filename)

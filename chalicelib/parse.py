@@ -25,6 +25,14 @@ from bs4 import BeautifulSoup, NavigableString
 
 AD_PREFIXES = ("mailer-", "content-")
 
+# Bounds on what one email can cost us. classify_all makes ONE paid vision call
+# per surviving scan, and a Lambda timeout mid-loop is retried twice by S3 — so
+# an email stuffed with image parts is a 3x cost-amplification lever, and a huge
+# body can OOM the 512MB function. The real corpus peaks at 6 scans.
+MAX_SCANS = 12
+MAX_SCAN_BYTES = 5 * 1024 * 1024
+MAX_TOTAL_BYTES = 20 * 1024 * 1024
+
 MAIL_SECTIONS = ("Expected Today", "Expected Tomorrow", "Expected This Week")
 PACKAGE_SECTIONS = (
     "Expected Today",
@@ -50,7 +58,7 @@ DATE_RE = re.compile(
 SUBJECT_DATE_RE = re.compile(r"Daily Digest for\s+\w{3},\s*(\d{1,2})/(\d{1,2})")
 # USPS tracking numbers in this corpus are 20-22 digits. Bounded to avoid
 # swallowing the long numeric IMb strings that appear elsewhere in the body.
-TRACKING_RE = re.compile(r"\b(\d{20,26})\b")
+TRACKING_RE = re.compile(r"\b(\d{20,26})\b", re.ASCII)
 ETA_RE = re.compile(r"Estimated Delivery on:\s*(.+?)\s*$", re.I)
 
 
@@ -347,22 +355,56 @@ def _extract_bodies(msg) -> tuple[str, str]:
     return "\n".join(html_parts), "\n".join(text_parts)
 
 
+def _safe_filename(name: str) -> str:
+    """Strip CR/LF/NUL out of an attachment filename at the boundary.
+
+    `get_filename()` percent-decodes RFC 2231 parameters, so a source part
+    carrying `filename*=utf-8''x%0D%0AX-Injected:%20yes` yields a string with a
+    real CRLF in it. `MIMEImage.add_header` under compat32 does not validate
+    header values, so that CRLF survives into the message SES sends — letting
+    whoever wrote the source email inject MIME part headers into our output. The
+    dangerous variant is a forged `Content-Type: text/html`, which would render
+    attacker-authored HTML inside a digest the reader trusts.
+
+    Sanitizing here rather than at the render site covers every consumer,
+    including `is_ad_attachment` and the `map_cid_senders` filename join.
+    """
+    return re.sub(r"[\x00-\x1f\x7f]", "", name or "")[:120]
+
+
+def _safe_content_type(ctype: str) -> str:
+    """Normalize at the boundary so every consumer inherits the guarantee.
+
+    `get_content_type()` does not sanitize: a malformed source part yields
+    `image/jpeg"\tevil: 1"`, which still passes an `image/` prefix check. render.py
+    validates before building the MIME header, but classify.py interpolates this
+    into a `data:` URL, so the check belongs here rather than at each use site.
+    """
+    subtype = (ctype or "").split("/", 1)[-1]
+    return f"image/{subtype}" if re.fullmatch(r"[a-z0-9.+-]{1,32}", subtype) else "image/jpeg"
+
+
 def _extract_images(msg) -> tuple[list[Scan], list[str]]:
-    scans, dropped = [], []
+    scans, dropped, total = [], [], 0
     for part in msg.walk():
         ctype = part.get_content_type()
         if not ctype.startswith("image/"):
             continue
-        name = part.get_filename() or (part.get("Content-ID", "") or "").strip("<>")
+        name = _safe_filename(
+            part.get_filename() or (part.get("Content-ID", "") or "").strip("<>")
+        )
         if not name:
             continue
         if is_ad_attachment(name):
             dropped.append(name)
             continue
-        data = part.get_payload(decode=True)
-        if not data:
+        if len(scans) >= MAX_SCANS:
             continue
-        scans.append(Scan(filename=name, content_type=ctype, data=data))
+        data = part.get_payload(decode=True)
+        if not data or len(data) > MAX_SCAN_BYTES or total + len(data) > MAX_TOTAL_BYTES:
+            continue
+        total += len(data)
+        scans.append(Scan(filename=name, content_type=_safe_content_type(ctype), data=data))
     for i, s in enumerate(scans):
         s.cid = f"scan{i}@usps-digest"
     return scans, dropped

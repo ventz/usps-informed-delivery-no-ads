@@ -283,3 +283,72 @@ def test_actionable_is_derived_not_model_supplied(mail_type, expected):
     """
     assert classify.Classification(mail_type=mail_type).actionable is expected
     assert "actionable" not in classify.SCHEMA["required"]
+
+
+# --- MIME safety ------------------------------------------------------------
+
+def test_attachment_filename_cannot_inject_mime_headers():
+    """Confirmed live: get_filename() percent-decodes RFC 2231, so a crafted
+    `filename*=utf-8''x%0D%0A...` put a real CRLF into Content-Disposition on the
+    message SES sends. The dangerous payload is a forged `Content-Type: text/html`
+    rendering attacker HTML inside a digest the reader trusts."""
+    raw = (
+        b"From: a@b.c\r\nTo: d@e.f\r\nSubject: x\r\n"
+        b'Content-Type: multipart/related; boundary="B"\r\n\r\n'
+        b"--B\r\nContent-Type: text/html\r\n\r\n<html></html>\r\n"
+        b"--B\r\nContent-Type: image/jpeg\r\n"
+        b"Content-Disposition: inline; filename*=utf-8''ev%0D%0AX-Injected:%20yes\r\n"
+        b"Content-Transfer-Encoding: base64\r\n\r\neHg=\r\n--B--\r\n"
+    )
+    d = parse.parse_digest(raw)
+    assert d.scans, "the crafted part should still be parsed as a scan"
+    assert "\r" not in d.scans[0].filename and "\n" not in d.scans[0].filename
+    blob = render.build_message(d, [classify.Classification()], "a@b.c", "d@e.f").as_bytes()
+    # The residual text may survive INSIDE the quoted filename, which is inert.
+    # What must not happen is it starting a header line of its own.
+    assert not any(ln.startswith(b"X-Injected") for ln in blob.splitlines())
+
+
+def test_content_type_is_sanitized_at_the_boundary():
+    """render.py validated at the use site; classify.py builds a data: URL from
+    the same value and had no check, so normalize once where it enters."""
+    raw = (
+        b"From: a@b.c\r\nTo: d@e.f\r\nSubject: x\r\n"
+        b'Content-Type: multipart/related; boundary="B"\r\n\r\n'
+        b"--B\r\nContent-Type: text/html\r\n\r\n<html></html>\r\n"
+        b'--B\r\nContent-Type: image/jp"eg\r\n\tevil: 1\r\n'
+        b'Content-Disposition: inline; filename="x.jpg"\r\n'
+        b"Content-Transfer-Encoding: base64\r\n\r\neHg=\r\n--B--\r\n"
+    )
+    d = parse.parse_digest(raw)
+    assert d.scans and d.scans[0].content_type == "image/jpeg"
+
+
+def test_attachment_count_and_size_are_capped():
+    """One paid vision call per scan, and an S3 retry redoes them all."""
+    parts = b"".join(
+        b"--B\r\nContent-Type: image/jpeg\r\n"
+        + f'Content-Disposition: inline; filename="{i}-068.jpg"\r\n'.encode()
+        + b"Content-Transfer-Encoding: base64\r\n\r\neHg=\r\n"
+        for i in range(40)
+    )
+    raw = (b"From: a@b.c\r\nTo: d@e.f\r\nSubject: x\r\n"
+           b'Content-Type: multipart/related; boundary="B"\r\n\r\n'
+           b"--B\r\nContent-Type: text/html\r\n\r\n<html></html>\r\n"
+           + parts + b"--B--\r\n")
+    assert len(parse.parse_digest(raw).scans) == parse.MAX_SCANS
+
+
+def test_tracking_regex_is_ascii_only():
+    """`\\d` is Unicode-aware without re.ASCII — Arabic-Indic digits matched and
+    produced a dead tracking link."""
+    assert not parse.TRACKING_RE.search("٠" * 22)
+    assert parse.TRACKING_RE.search("9261290335949247070387")
+
+
+def test_malformed_content_type_cannot_forge_headers():
+    d = parse.Digest(announced_mail=1)
+    d.scans.append(parse.Scan("x.jpg", 'image/jp"eg\r\nX-Injected: yes', b"x", "c0"))
+    blob = render.build_message(d, [classify.Classification()], "a@b.c", "d@e.f").as_bytes()
+    assert not any(ln.startswith(b"X-Injected") for ln in blob.splitlines())
+    assert b"Content-Type: image/jpeg" in blob   # fell back to the safe subtype
