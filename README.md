@@ -19,6 +19,7 @@ in `.env`); a rebuilt one arrives in your inbox a few seconds later.
 - [How the ad-stripping works](#how-the-ad-stripping-works) — the filename deny-list, and two traps
   - [Where the sender comes from](#where-the-sender-comes-from) — markup first, vision as fallback
 - [What OpenAI is used for](#what-openai-is-used-for) — exactly what is sent, asked, and not asked
+- [Stopping the mail itself](#stopping-the-mail-itself) — the one-time checklist, and what can't be stopped
 - [Layout](#layout) — file-by-file map
 - [AWS](#aws) — resources, deploy, logs
 - [Feeding it](#feeding-it) — forward-on-sender, or repoint Informed Delivery
@@ -279,6 +280,32 @@ lose the digest.
 
 ---
 
+## Stopping the mail itself
+
+This project makes the digest readable. It does not stop the mail — but almost all
+of that is a one-time job, and it's written up here:
+
+**→ [How to stop physical junk mail](docs/stopping-junk-mail.md)**
+
+An afternoon of work removes most of it permanently: prescreened credit and
+insurance offers (free, federally mandated), broad prospect mail (DMAchoice, $8 /
+10 years), the shared-mail envelopes, catalogs, and the one data broker that still
+runs a real postal opt-out. The doc is written to be printed, with blanks for the
+renewal dates — they expire, and moving house silently undoes them.
+
+It also covers what *cannot* be stopped, including Informed Delivery's own
+advertiser campaigns. USPS offers no setting for those, which is why this project
+exists.
+
+> A per-mailpiece "opt out" link was built and then deliberately removed. Once the
+> one-time steps are done, roughly one mailpiece a month has a company-specific
+> opt-out that is both discoverable and useful — and of eight large mailers checked,
+> only two offered a web page at all; the rest were phone, email, or nothing. A
+> curated URL registry cost more to maintain than it returned, and could not detect
+> a link that still resolved but had quietly stopped being an opt-out page.
+
+---
+
 ## Layout
 
 | Path | Purpose |
@@ -288,7 +315,7 @@ lose the digest.
 | `chalicelib/parse.py` | MIME → `Digest`; ad filter; sender mapping |
 | `chalicelib/classify.py` | GPT-5.6 SOL vision → `Classification` |
 | `chalicelib/render.py` | `Digest` → HTML + MIME assembly |
-| `tests/` | 37 regression tests |
+| `tests/` | Regression tests pinned to the real corpus |
 | `tools/` | Dev + ops scripts: fixtures, local runs, S3 inspection, deploy |
 
 ---
