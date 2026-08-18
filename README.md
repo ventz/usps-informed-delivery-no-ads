@@ -19,6 +19,7 @@ in `.env`); a rebuilt one arrives in your inbox a few seconds later.
 - [How the ad-stripping works](#how-the-ad-stripping-works) — the filename deny-list, and two traps
   - [Where the sender comes from](#where-the-sender-comes-from) — markup first, vision as fallback
 - [What OpenAI is used for](#what-openai-is-used-for) — exactly what is sent, asked, and not asked
+- [Security](#security) — who is allowed to feed the pipeline, and why it matters
 - [Stopping the mail itself](#stopping-the-mail-itself) — the one-time checklist, and what can't be stopped
 - [Layout](#layout) — file-by-file map
 - [AWS](#aws) — resources, deploy, logs
@@ -157,6 +158,7 @@ cp .env.example .env
 | `APP_BUCKET_NAME` | `usps-ai-email-123456789012` | Raw inbound email, 90-day expiry |
 | `DIGEST_FROM` | `no-reply@domainViaSES.tld` | Verified SES sender |
 | `DIGEST_TO` | `you@yourmail.tld` | Where the clean digest lands |
+| `ALLOWED_FORWARDERS` | *(defaults to `DIGEST_TO`)* | Who may forward digests in — see [Security](#security) |
 | `OPENAI_API_KEY` | `sk-proj-…` | Vision classification |
 | `OPENAI_MODEL` | `gpt-5.6-sol` | Any vision-capable model |
 
@@ -173,6 +175,11 @@ cp .env.example .env
 ```bash
 cp .chalice/config.json.example .chalice/config.json   # then fill in the same values
 ```
+
+The Lambda reads its settings from this file, not from `.env` — so if you set
+`ALLOWED_FORWARDERS`, add it here too. It is deliberately absent from the example: JSON
+takes no comments, and a placeholder copied verbatim into Lambda would reject every real
+digest. Leaving it out applies the safe `DIGEST_TO` default.
 
 **5. Deploy and try it**
 
@@ -280,6 +287,53 @@ lose the digest.
 
 ---
 
+## Security
+
+`SES_RECIPIENT` is an address, and addresses leak. Anyone who learns yours can drop a
+message into your bucket, and the Lambda will parse it and mail it onward from
+`DIGEST_FROM` — a sender you trust, arriving unattended, looking exactly like every other
+digest. Escaping handles HTML and header injection, but nothing stops a forged sender name
+printed across an attacker-supplied full-width image. So the pipeline checks *who forwarded
+it* before it parses anything.
+
+Three gates run in `app._accept`, in order: a 15 MB size cap (before parsing, so a hostile
+body can't OOM the function), the SES spam and virus verdicts, and the forwarder
+allow-list. The verdict check fails **open** — a missing `X-SES-Spam-Verdict` or
+`X-SES-Virus-Verdict` counts as a pass, so that local fixtures still run. SES always stamps
+both on mail it receives, so in production the header is never absent.
+
+**`ALLOWED_FORWARDERS` defaults to `DIGEST_TO`**, which is correct for the ordinary setup —
+you forward from the same mailbox the clean digest comes back to. Set it explicitly when
+the forwarding address differs — but an explicit list **replaces** that default rather than
+extending it, so list `DIGEST_TO` yourself if you also forward by hand from it. Entries are comma-separated and case-insensitive, and each
+is either a full address (matched exactly) or a bare `@customdomain.tld` (matched against
+the domain and its subdomains — not a substring match, so `@customdomain.tld` will not
+accept `attacker@customdomain.tld.evil.example`):
+
+```
+ALLOWED_FORWARDERS=youremail@gmail.com,@customdomain.tld
+```
+
+That covers the common split setup: you forward the occasional digest by hand from Gmail,
+while a filter on your custom domain auto-forwards the rest.
+
+> **Gmail's auto-forward does not send as your own address.** It rewrites the envelope
+> sender to `youremail+caf_=usps=domainviases.tld@customdomain.tld`. An allow-list holding
+> only your plain address would reject every auto-forwarded digest — silently, since a
+> rejection is a log line, not a bounce. The `+tag` is stripped before matching so one
+> entry covers both hand- and auto-forwarded mail. If digests stop arriving, check the
+> logs for `rejecting: unrecognised forwarder` first.
+
+Setting `ALLOWED_FORWARDERS=*` disables the check and accepts anything. That is reasonable
+locally; in production it means the only thing between a stranger and a trusted email in
+your inbox is that they haven't guessed `SES_RECIPIENT`.
+
+Note that SPF and DKIM cannot help here. By the time the digest reaches you it has been
+forwarded, so those verdicts attest to your *forwarder's* domain, never to USPS's — which
+is exactly why the allow-list is the real identity check.
+
+---
+
 ## Stopping the mail itself
 
 This project makes the digest readable. It does not stop the mail — but almost all
@@ -369,7 +423,9 @@ uv run tools/catch_verification.py --watch
 **1. Forward from your mail provider (recommended to start).**
 Add a filter on the sender `@email.informeddelivery.usps.com` that forwards to
 `SES_RECIPIENT`. You still receive the original — file it into a folder "just in case" —
-and read only the transformed one. Nothing breaks if the pipeline does.
+and read only the transformed one. Nothing breaks if the pipeline does. Add the forwarding
+account to [`ALLOWED_FORWARDERS`](#security) when it isn't `DIGEST_TO`, or the gate will
+drop every auto-forwarded digest.
 
 **2. Change the address at USPS (long-term, once you trust it).**
 Point your Informed Delivery account email at `SES_RECIPIENT` directly. USPS sends to one
@@ -386,6 +442,7 @@ digest flows through automatically from then on.
 | Forwarded mail never appears in S3 | Usually just latency (~15 s). Verify the `usps` rule is enabled and no earlier rule has a `StopAction`. |
 | `Missing required config: ...` | `.env` not filled in — copy `.env.example`. |
 | `ModuleNotFoundError: bs4` on deploy | Local venv not synced — run `uv sync`. |
+| Mail lands in S3 but no digest arrives | Check the logs for `rejecting: unrecognised forwarder` — see [Security](#security). Gmail auto-forward sends as `you+caf_=…`, not as your plain address. |
 | Digest renders with no mail | Likely correct: an ad-only day. Check the "did not provide a scan" notice. |
 | Sender shows a bare PO Box | Piece had no `FROM:` label and the envelope is anonymous. Expected. |
 | Mojibake in the email | HTML needs `<meta charset="utf-8">` and the MIME part an explicit utf-8 charset. |

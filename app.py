@@ -11,6 +11,7 @@ see CLAUDE.md "CRITICAL CONSTRAINT". Do not add one.
 
 import email
 import email.policy
+import email.utils
 import logging
 
 import boto3
@@ -33,16 +34,57 @@ SKIP_KEYS = {"AMAZON_SES_SETUP_NOTIFICATION"}
 # Anyone who learns SES_RECIPIENT can drop a fully attacker-authored "digest"
 # into the bucket, and it would be parsed and mailed onward from DIGEST_FROM —
 # a trusted, unattended email. Escaping stops HTML/header injection, but not a
-# forged sender name over an arbitrary full-width image. Optional allow-list of
-# the address(es) that forward to us; unset = accept anything (local fixtures).
+# forged sender name over an arbitrary full-width image. So we allow-list the
+# address(es) that forward to us.
+#
+# Defaults to DIGEST_TO: the common setup forwards from the same mailbox the
+# clean digest comes back to, so the safe value needs no extra configuration.
+# Set ALLOWED_FORWARDERS when the forwarding address differs. Comma-separated;
+# an entry is either a full address (matched exactly) or a bare "@example.tld"
+# (matched against the domain, including its subdomains). "*" disables the
+# check entirely. Deliberately NOT a substring match — "@example.tld" as a
+# substring would also accept "attacker@example.tld.evil.example".
 ALLOWED_FORWARDERS = {
     a.strip().lower()
-    for a in (config.get("ALLOWED_FORWARDERS") or "").split(",")
+    for a in (config.get("ALLOWED_FORWARDERS") or DIGEST_TO).split(",")
     if a.strip()
 }
+if "*" in ALLOWED_FORWARDERS:
+    ALLOWED_FORWARDERS = set()
 
 # Reject before parsing rather than risk OOM on a hostile body.
 MAX_RAW_BYTES = 15 * 1024 * 1024
+
+
+def _forwarder(msg) -> str:
+    """The address that forwarded this to us, normalised for allow-list matching.
+
+    Any `+tag` is dropped, because Gmail's auto-forward filter does not send as
+    you@gmail.com — it rewrites the envelope sender to
+    `you+caf_=local=domain.tld@gmail.com`. Matching the untagged address lets one
+    allow-list entry cover both hand- and auto-forwarded mail. Note the tag sits
+    on the FORWARDING account, which need not be DIGEST_TO: forwarding from
+    you@yourdomain.tld into a Gmail inbox still needs an explicit entry.
+    """
+    header = msg.get("Return-Path") or msg.get("From") or ""
+    address = email.utils.parseaddr(str(header))[1].lower().strip()
+    local, at, domain = address.rpartition("@")
+    if at and "+" in local:
+        address = f"{local.split('+', 1)[0]}@{domain}"
+    return address
+
+
+def _is_allowed(address: str) -> bool:
+    """Exact address match, or domain match for a bare `@example.tld` entry."""
+    domain = address.rpartition("@")[2]
+    for entry in ALLOWED_FORWARDERS:
+        if entry.startswith("@"):
+            suffix = entry[1:]
+            if domain == suffix or domain.endswith("." + suffix):
+                return True
+        elif address == entry:
+            return True
+    return False
 
 
 def _accept(raw: bytes) -> bool:
@@ -65,9 +107,9 @@ def _accept(raw: bytes) -> bool:
         # SPF/DKIM here attest to the FORWARDER's domain, not USPS's, since the
         # mail reaches us forwarded — so the forwarder allow-list is the real
         # identity check.
-        origin = (msg.get("Return-Path") or msg.get("From") or "").lower()
-        if not any(a in origin for a in ALLOWED_FORWARDERS):
-            app.log.warning("rejecting: unrecognised forwarder %r", origin)
+        forwarder = _forwarder(msg)
+        if not _is_allowed(forwarder):
+            app.log.warning("rejecting: unrecognised forwarder %r", forwarder)
             return False
     return True
 
