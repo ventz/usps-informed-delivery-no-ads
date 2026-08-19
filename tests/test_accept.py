@@ -128,57 +128,71 @@ def test_explicit_list_replaces_the_digest_to_default(monkeypatch):
     assert not app._accept(build("you@yourmail.tld"))
 
 
-def test_falls_back_to_from_when_return_path_absent(monkeypatch):
-    """The From: fallback reads a fully attacker-authored header — cover it."""
-    app = load_app(monkeypatch, None)
-    raw = (
-        "X-SES-Spam-Verdict: PASS\r\n"
-        "X-SES-Virus-Verdict: PASS\r\n"
-        "From: You <you@yourmail.tld>\r\n"
-        "\r\n"
-        "body\r\n"
-    ).encode()
-    assert app._accept(raw)
-    hostile = raw.replace(b"you@yourmail.tld", b"attacker@evil.example")
-    assert not app._accept(hostile)
+def test_missing_return_path_rejected(monkeypatch):
+    """The From: fallback was removed; absent Return-Path must fail closed.
 
-
-def test_display_name_form_is_parsed(monkeypatch):
-    """parseaddr is load-bearing only here; every other fixture is a bare addr.
-
-    A Return-Path is a bare addr-spec, so the display-name form only reaches us
-    through the From: fallback.
+    From is wholly attacker-authored, and policy.default normalises a lot into
+    a plain address. All of these once resolved to an allowed address through
+    the fallback; none may be accepted now.
     """
     app = load_app(monkeypatch, None)
-    assert app._accept(with_from('"You, Person" <you@yourmail.tld>'))
+    for value in (
+        "you@yourmail.tld",
+        '"You, Person" <you@yourmail.tld>',
+        "=?utf-8?q?you=40yourmail=2Etld?=",          # RFC 2047, no addr-spec
+        "=?utf-8?q?you=2Bx=40yourmail=2Etld?=",      # encoded +tag
+        "<@relay.evil.example:you@yourmail.tld>",    # obs-route
+        "undisclosed:you@yourmail.tld;",             # group syntax
+    ):
+        assert not app._accept(with_from(value)), value
 
 
-def test_from_fallback_is_forgeable(monkeypatch):
-    """Documents a known weakness rather than asserting a defence.
-
-    The From: fallback fires only when Return-Path is absent, and From is
-    entirely attacker-authored — so anyone who can post to the bucket can claim
-    to be an allowed forwarder. In production SES always stamps a Return-Path,
-    so the fallback never fires; it exists for local fixtures. If that ever
-    changes, this gate is not the thing protecting you.
-    """
+def test_ambiguous_return_path_fails_closed(monkeypatch):
+    """Where parseaddr can't resolve one address, the result must be rejection."""
     app = load_app(monkeypatch, None)
-    assert app._accept(with_from("you@yourmail.tld"))
-
-
-def test_ambiguous_from_forms_fail_closed(monkeypatch):
-    """Where parseaddr can't pick one address, the result must be a rejection."""
-    app = load_app(monkeypatch, None)
-    # Two bare addresses: parseaddr yields nothing rather than guessing.
-    assert not app._accept(with_from("you@yourmail.tld, attacker@evil.example"))
-    # An allowed address used as a *display name* must not beat the real addr-spec.
-    assert not app._accept(with_from('"you@yourmail.tld" <attacker@evil.example>'))
+    assert not app._accept(build("you@yourmail.tld, attacker@evil.example"))
+    assert not app._accept(build("not-an-address"))
 
 
 def test_garbage_body_rejected(monkeypatch):
     """message_from_bytes accepts almost anything; the empty forwarder rejects it."""
     app = load_app(monkeypatch, None)
     assert not app._accept(b"\xff\xfe\x00 not a message at all")
+
+
+def test_missing_verdict_header_rejected(monkeypatch):
+    """Fail CLOSED: absence means the message didn't arrive the way we think."""
+    app = load_app(monkeypatch, None)
+    for drop in ("X-SES-Spam-Verdict", "X-SES-Virus-Verdict"):
+        raw = b"".join(
+            line + b"\r\n"
+            for line in build("you@yourmail.tld").split(b"\r\n")
+            if not line.startswith(drop.encode())
+        )
+        assert not app._accept(raw), drop
+
+
+def test_blank_allowed_forwarders_is_a_hard_error(monkeypatch):
+    """A value that filters to nothing must NOT silently disable the gate.
+
+    " " and "," are truthy enough to beat the DIGEST_TO default but filter to an
+    empty set, which would skip the check with no log line — failing open just
+    as invisibly as the 2026-08-17 outage failed closed.
+    """
+    for value in (" ", ",", ", ,"):
+        with pytest.raises(RuntimeError, match="no usable entry"):
+            load_app(monkeypatch, value)
+
+
+def test_star_mixed_with_entries_is_a_hard_error(monkeypatch):
+    with pytest.raises(RuntimeError, match='mixes "\\*"'):
+        load_app(monkeypatch, "*,you@yourmail.tld")
+
+
+def test_bare_at_entry_is_a_hard_error(monkeypatch):
+    """A lone "@" would match every domain via the endswith(".") limb."""
+    with pytest.raises(RuntimeError, match="bare"):
+        load_app(monkeypatch, "@")
 
 
 def test_matching_is_case_insensitive_and_whitespace_tolerant(monkeypatch):

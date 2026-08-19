@@ -41,16 +41,42 @@ SKIP_KEYS = {"AMAZON_SES_SETUP_NOTIFICATION"}
 # clean digest comes back to, so the safe value needs no extra configuration.
 # Set ALLOWED_FORWARDERS when the forwarding address differs. Comma-separated;
 # an entry is either a full address (matched exactly) or a bare "@example.tld"
-# (matched against the domain, including its subdomains). "*" disables the
-# check entirely. Deliberately NOT a substring match — "@example.tld" as a
+# (matched against the domain, including its subdomains). A lone "*" disables
+# the check entirely. Deliberately NOT a substring match — "@example.tld" as a
 # substring would also accept "attacker@example.tld.evil.example".
-ALLOWED_FORWARDERS = {
-    a.strip().lower()
-    for a in (config.get("ALLOWED_FORWARDERS") or DIGEST_TO).split(",")
-    if a.strip()
-}
-if "*" in ALLOWED_FORWARDERS:
+#
+# Turning the gate OFF must be explicit and loud. A value like " " or "," is
+# truthy enough to beat the DIGEST_TO default but filters to an empty set, which
+# would skip the check silently — the same invisible-failure shape as the
+# 2026-08-17 outage, only failing open instead of closed. So anything set but
+# unusable is a hard error at import, and the active mode is logged once.
+_forwarders_raw = config.get("ALLOWED_FORWARDERS") or DIGEST_TO
+ALLOWED_FORWARDERS = {a.strip().lower() for a in _forwarders_raw.split(",") if a.strip()}
+GATE_DISABLED = ALLOWED_FORWARDERS == {"*"}
+
+if GATE_DISABLED:
     ALLOWED_FORWARDERS = set()
+elif not ALLOWED_FORWARDERS:
+    raise RuntimeError(
+        "ALLOWED_FORWARDERS is set but contains no usable entry "
+        f"({_forwarders_raw!r}). Unset it to default to DIGEST_TO, "
+        'or set it to "*" to disable the forwarder check.'
+    )
+elif "*" in ALLOWED_FORWARDERS:
+    raise RuntimeError(
+        f'ALLOWED_FORWARDERS mixes "*" with real entries ({_forwarders_raw!r}). '
+        'Use "*" alone to disable the check, or list addresses without it.'
+    )
+elif "@" in ALLOWED_FORWARDERS:
+    raise RuntimeError(
+        'ALLOWED_FORWARDERS contains a bare "@", which would match any domain. '
+        "Use @example.tld to allow a domain."
+    )
+
+app.log.info(
+    "forwarder gate: %s",
+    "DISABLED (ALLOWED_FORWARDERS=*)" if GATE_DISABLED else sorted(ALLOWED_FORWARDERS),
+)
 
 # Reject before parsing rather than risk OOM on a hostile body.
 MAX_RAW_BYTES = 15 * 1024 * 1024
@@ -65,9 +91,15 @@ def _forwarder(msg) -> str:
     allow-list entry cover both hand- and auto-forwarded mail. Note the tag sits
     on the FORWARDING account, which need not be DIGEST_TO: forwarding from
     you@yourdomain.tld into a Gmail inbox still needs an explicit entry.
+
+    Return-Path ONLY. There used to be a `From:` fallback "so local fixtures
+    work", but no local path calls _accept at all — the sole caller is the S3
+    handler. It bought nothing and cost a bypass surface: From is wholly
+    attacker-authored, and RFC 2047 encoding, obs-route, folded domains and
+    group syntax all normalise into a plain address. Absent Return-Path now
+    yields "" and fails closed. SES always stamps it on mail it receives.
     """
-    header = msg.get("Return-Path") or msg.get("From") or ""
-    address = email.utils.parseaddr(str(header))[1].lower().strip()
+    address = email.utils.parseaddr(str(msg.get("Return-Path") or ""))[1].lower().strip()
     local, at, domain = address.rpartition("@")
     if at and "+" in local:
         address = f"{local.split('+', 1)[0]}@{domain}"
@@ -92,25 +124,35 @@ def _accept(raw: bytes) -> bool:
     if len(raw) > MAX_RAW_BYTES:
         app.log.warning("rejecting: %s bytes exceeds cap", len(raw))
         return False
+    # The whole body is wrapped, not just the parse: policy.default reads
+    # headers lazily, so a malformed header can throw from msg.get() rather
+    # than from message_from_bytes. Escaping here would propagate out of the
+    # handler and put S3 into a retry loop against a hostile object.
     try:
         msg = email.message_from_bytes(raw, policy=email.policy.default)
+        # Fail CLOSED on a missing verdict. SES always stamps these on mail it
+        # receives, and nothing local calls _accept, so absence means the
+        # message did not arrive the way we think it did.
+        for header in ("X-SES-Spam-Verdict", "X-SES-Virus-Verdict"):
+            verdict = msg.get(header)
+            if verdict is None:
+                app.log.warning("rejecting: no %s header", header)
+                return False
+            if str(verdict).upper() != "PASS":
+                app.log.warning("rejecting: %s=%s", header, verdict)
+                return False
+        if ALLOWED_FORWARDERS:
+            # NOTE: Return-Path is the SMTP envelope MAIL FROM — asserted by
+            # whoever connected, not verified. This gate raises the bar (you
+            # must also learn SES_RECIPIENT) but does NOT authenticate. The
+            # README's "Security" section covers the SPF/DKIM checks that would.
+            forwarder = _forwarder(msg)
+            if not _is_allowed(forwarder):
+                app.log.warning("rejecting: unrecognised forwarder %r", forwarder)
+                return False
     except Exception:
-        app.log.warning("rejecting: unparseable message")
+        app.log.warning("rejecting: unparseable message", exc_info=True)
         return False
-    # Fail OPEN on a missing verdict header so local fixtures still work; SES
-    # always stamps these on mail it receives.
-    for header in ("X-SES-Spam-Verdict", "X-SES-Virus-Verdict"):
-        if (msg.get(header) or "PASS").upper() != "PASS":
-            app.log.warning("rejecting: %s=%s", header, msg.get(header))
-            return False
-    if ALLOWED_FORWARDERS:
-        # SPF/DKIM here attest to the FORWARDER's domain, not USPS's, since the
-        # mail reaches us forwarded — so the forwarder allow-list is the real
-        # identity check.
-        forwarder = _forwarder(msg)
-        if not _is_allowed(forwarder):
-            app.log.warning("rejecting: unrecognised forwarder %r", forwarder)
-            return False
     return True
 
 

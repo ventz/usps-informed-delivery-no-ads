@@ -96,7 +96,7 @@ flowchart TD
 
     subgraph aws ["AWS — profile AWSProfileName"]
         B["SES receipt rule 'usps'<br/>SES_RECIPIENT"]
-        C[("S3 APP_BUCKET_NAME<br/>90-day retention, no deletes")]
+        C[("S3 APP_BUCKET_NAME<br/>1-year retention, no deletes")]
         subgraph lambda ["Lambda usps-dev-handle_s3_email"]
             D["parse.py<br/>drop mailer-/content- ads<br/>extract scans, packages, senders"]
             E["classify.py<br/>GPT-5.6 SOL vision<br/>mail_type + summary only"]
@@ -155,7 +155,7 @@ cp .env.example .env
 | `AWS_REGION` | `us-east-1` | SES *receiving* is region-scoped — pick a region that supports it |
 | `AWS_ACCOUNT_ID` | `123456789012` | Only used to name the bucket |
 | `SES_RECIPIENT` | `usps@domainViaSES.tld` | Address you forward digests to |
-| `APP_BUCKET_NAME` | `usps-ai-email-123456789012` | Raw inbound email, 90-day expiry |
+| `APP_BUCKET_NAME` | `usps-ai-email-123456789012` | Raw inbound email, 1-year expiry |
 | `DIGEST_FROM` | `no-reply@domainViaSES.tld` | Verified SES sender |
 | `DIGEST_TO` | `you@yourmail.tld` | Where the clean digest lands |
 | `ALLOWED_FORWARDERS` | *(defaults to `DIGEST_TO`)* | Who may forward digests in — see [Security](#security) |
@@ -166,7 +166,7 @@ cp .env.example .env
 
 - Verify your domain in SES, and verify `DIGEST_TO` as an identity if your account is
   still in the SES sandbox.
-- Create the S3 bucket (`APP_BUCKET_NAME`) and give it a 90-day expiry lifecycle rule.
+- Create the S3 bucket (`APP_BUCKET_NAME`) and give it a 1-year expiry lifecycle rule.
 - Add an SES **receipt rule** for `SES_RECIPIENT` with an S3 action writing to that bucket.
   That address needs no mailbox — SES writes the raw MIME straight to S3.
 
@@ -298,9 +298,9 @@ it* before it parses anything.
 
 Three gates run in `app._accept`, in order: a 15 MB size cap (before parsing, so a hostile
 body can't OOM the function), the SES spam and virus verdicts, and the forwarder
-allow-list. The verdict check fails **open** — a missing `X-SES-Spam-Verdict` or
-`X-SES-Virus-Verdict` counts as a pass, so that local fixtures still run. SES always stamps
-both on mail it receives, so in production the header is never absent.
+allow-list. All three fail **closed** — a missing verdict header is a rejection, not a pass,
+and an absent `Return-Path` is too. Nothing outside the Lambda calls this gate, so there is
+no local path that needs the leniency.
 
 **`ALLOWED_FORWARDERS` defaults to `DIGEST_TO`**, which is correct for the ordinary setup —
 you forward from the same mailbox the clean digest comes back to. Set it explicitly when
@@ -328,9 +328,23 @@ Setting `ALLOWED_FORWARDERS=*` disables the check and accepts anything. That is 
 locally; in production it means the only thing between a stranger and a trusted email in
 your inbox is that they haven't guessed `SES_RECIPIENT`.
 
-Note that SPF and DKIM cannot help here. By the time the digest reaches you it has been
-forwarded, so those verdicts attest to your *forwarder's* domain, never to USPS's — which
-is exactly why the allow-list is the real identity check.
+**Be clear about what this gate is and isn't.** It matches `Return-Path` — the SMTP envelope
+sender, which is *asserted* by whoever connects, not verified. So the allow-list raises the
+bar (an attacker must also learn `SES_RECIPIENT`) but it does **not** authenticate. Treat it
+as one layer, not as proof of origin.
+
+Authentication is available and this project does not yet use it. SES stamps an
+`Authentication-Results` header carrying `spf=`, `dkim=` and `dmarc=` results under its own
+`amazonses.com` authserv-id, and because SES prepends its trace headers, a forged copy in
+the message body sits below it and is never read. Two checks worth adding:
+
+- **`spf=pass`, cross-checked against the header's own `envelope-from=`.** This authenticates
+  the *forwarder* — the thing the allow-list is trying to assert. Note SPF binds a domain,
+  not a mailbox: with a `@gmail.com` entry, `spf=pass` only means "some Gmail user".
+- **`dkim=pass` for USPS's own domain.** Stronger, and available on the auto-forward path:
+  a forward that preserves the message leaves USPS's signature intact, so SES verifies USPS
+  *cryptographically*, end to end. Forwarding by hand rewrites the body and breaks it, so
+  this check would reject hand-forwarded digests.
 
 ---
 
@@ -383,7 +397,7 @@ from `.chalice/config.json`. Both files are gitignored — `.env.example` and
 | Resource | Name |
 |---|---|
 | SES receipt rule | `usps` in rule set `RECEIVE` → `SES_RECIPIENT` |
-| Input bucket | `APP_BUCKET_NAME` (90-day expiry) |
+| Input bucket | `APP_BUCKET_NAME` (1-year expiry) |
 | Lambda | `usps-dev-handle_s3_email` (512 MB, 300 s) |
 | Sender / recipient | `DIGEST_FROM` → `DIGEST_TO` |
 
@@ -405,7 +419,7 @@ Logs:
 aws --profile "$AWS_PROFILE" logs tail /aws/lambda/usps-dev-handle_s3_email --since 10m
 ```
 
-Raw emails are deliberately **not** deleted after processing — they expire on the 90-day
+Raw emails are deliberately **not** deleted after processing — they expire on the 1-year
 lifecycle rule and serve as the regression corpus.
 
 ---
