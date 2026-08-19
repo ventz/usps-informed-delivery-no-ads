@@ -14,6 +14,7 @@ in `.env`); a rebuilt one arrives in your inbox a few seconds later.
 - [What you get](#what-you-get)
   - [What USPS sends / what you actually wanted](#what-usps-sends--what-you-actually-wanted) — before/after screenshots
 - [Architecture](#architecture) — flow diagram, and why there is no web surface
+- [Assumptions](#assumptions) — what you need in place (SES for inbound is the hard one)
 - [Quick setup](#quick-setup) — ~15 minutes: clone, `.env`, AWS, deploy
 - [Development](#development) — local dev loop, free and side-effect-free
 - [How the ad-stripping works](#how-the-ad-stripping-works) — the filename deny-list, and two traps
@@ -126,10 +127,35 @@ Gmail never prompts to load remote images.
 
 ---
 
+## Assumptions
+
+This is a personal-scale pipeline, not a product. It assumes:
+
+- **AWS SES for *receiving*, in a region that supports it.** This is the hard requirement —
+  inbound is the trigger, not a convenience. SES writes raw MIME to S3, which fires the
+  Lambda. SES receiving is region-scoped and not offered everywhere.
+- **A domain you control**, verified in SES, with MX pointed at SES for whatever subdomain
+  `SES_RECIPIENT` lives on. That address needs no mailbox — SES writes raw MIME to S3.
+- **SES production access** to send anywhere; in the sandbox, verify `DIGEST_TO` first.
+- **An OpenAI API key.** Each kept scan — your name and address included — is uploaded for
+  classification. See [What OpenAI is used for](#what-openai-is-used-for).
+- **A USPS Informed Delivery account**, and a way to forward its digests in — see
+  [Feeding it](#feeding-it).
+- **Python 3.13 and `uv`**, the only dependency source of truth.
+
+**On other providers:** the *sending* half is replaceable — Resend, Postmark and Mailgun all do
+it well, and Resend supports the inline `cid:` images this digest needs. Expect a rewrite, not
+a re-point: `render.py` assembles raw MIME for `SendRawEmail`, while Resend takes JSON. The
+*receiving* half is different — **Resend is send-only, with no inbound product**, so it cannot
+start this pipeline. A substitute must accept mail for your domain and hand you the raw
+message: SES, a Cloudflare Email Worker, Mailgun inbound routes, or your own SMTP server.
+
+---
+
 ## Quick setup
 
-Roughly 15 minutes, most of it on the AWS side. You need an AWS account, a domain you can
-verify in SES, and an OpenAI API key.
+Roughly 15 minutes, most of it on the AWS side. See [Assumptions](#assumptions) for what you
+need in place first.
 
 **1. Clone and install**
 
@@ -164,11 +190,9 @@ cp .env.example .env
 
 **3. Create the AWS side**
 
-- Verify your domain in SES, and verify `DIGEST_TO` as an identity if your account is
-  still in the SES sandbox.
-- Create the S3 bucket (`APP_BUCKET_NAME`) and give it a 1-year expiry lifecycle rule.
+- Verify your domain in SES (plus `DIGEST_TO` as an identity, if you're still in the sandbox).
+- Create the S3 bucket (`APP_BUCKET_NAME`) with a 1-year expiry lifecycle rule.
 - Add an SES **receipt rule** for `SES_RECIPIENT` with an S3 action writing to that bucket.
-  That address needs no mailbox — SES writes the raw MIME straight to S3.
 
 **4. Give Lambda the same settings**
 
@@ -176,10 +200,9 @@ cp .env.example .env
 cp .chalice/config.json.example .chalice/config.json   # then fill in the same values
 ```
 
-The Lambda reads its settings from this file, not from `.env` — so if you set
-`ALLOWED_FORWARDERS`, add it here too. It is deliberately absent from the example: JSON
-takes no comments, and a placeholder copied verbatim into Lambda would reject every real
-digest. Leaving it out applies the safe `DIGEST_TO` default.
+The Lambda reads settings from here, not `.env` — so add `ALLOWED_FORWARDERS` too if you set
+it. It is absent from the example on purpose: JSON takes no comments, and a placeholder
+copied verbatim would reject every real digest. Omitting it applies the `DIGEST_TO` default.
 
 **5. Deploy and try it**
 
@@ -289,62 +312,61 @@ lose the digest.
 
 ## Security
 
-`SES_RECIPIENT` is an address, and addresses leak. Anyone who learns yours can drop a
-message into your bucket, and the Lambda will parse it and mail it onward from
-`DIGEST_FROM` — a sender you trust, arriving unattended, looking exactly like every other
-digest. Escaping handles HTML and header injection, but nothing stops a forged sender name
-printed across an attacker-supplied full-width image. So the pipeline checks *who forwarded
-it* before it parses anything.
+`SES_RECIPIENT` is an address, and addresses leak. Anyone who learns yours can drop a message
+into your bucket and have it mailed onward from `DIGEST_FROM` — a sender you trust, arriving
+unattended, looking like every other digest. Escaping handles HTML and header injection, but
+nothing stops a forged sender name printed across an attacker-supplied image. So the pipeline
+checks *who forwarded it* before parsing anything.
 
-Three gates run in `app._accept`, in order: a 15 MB size cap (before parsing, so a hostile
-body can't OOM the function), the SES spam and virus verdicts, and the forwarder
-allow-list. All three fail **closed** — a missing verdict header is a rejection, not a pass,
-and an absent `Return-Path` is too. Nothing outside the Lambda calls this gate, so there is
-no local path that needs the leniency.
+Three gates run in `app._accept`: a 15 MB size cap (before parsing, so a hostile body can't
+OOM the function), the SES spam and virus verdicts, and the forwarder allow-list. All fail
+**closed** — a missing verdict header or absent `Return-Path` is a rejection. Nothing outside
+the Lambda calls this gate, so no local path needs the leniency.
 
-**`ALLOWED_FORWARDERS` defaults to `DIGEST_TO`**, which is correct for the ordinary setup —
-you forward from the same mailbox the clean digest comes back to. Set it explicitly when
-the forwarding address differs — but an explicit list **replaces** that default rather than
-extending it, so list `DIGEST_TO` yourself if you also forward by hand from it. Entries are comma-separated and case-insensitive, and each
-is either a full address (matched exactly) or a bare `@customdomain.tld` (matched against
-the domain and its subdomains — not a substring match, so `@customdomain.tld` will not
-accept `attacker@customdomain.tld.evil.example`):
+**`ALLOWED_FORWARDERS` defaults to `DIGEST_TO`** — correct when you forward from the same
+mailbox the digest returns to. Set it when the forwarding address differs, but note an
+explicit list **replaces** the default rather than extending it, so include `DIGEST_TO`
+yourself if you also forward by hand. Entries are comma-separated and case-insensitive;
+each is a full address (matched exactly) or a bare `@customdomain.tld`
+(the domain and its subdomains — *not* a substring, so it will not accept
+`attacker@customdomain.tld.evil.example`):
 
 ```
 ALLOWED_FORWARDERS=youremail@gmail.com,@customdomain.tld
 ```
 
-That covers the common split setup: you forward the occasional digest by hand from Gmail,
-while a filter on your custom domain auto-forwards the rest.
+> **Gmail's auto-forward does not send as your own address.** It rewrites the envelope sender
+> to `youremail+caf_=usps=domainviases.tld@customdomain.tld`, so an allow-list holding only
+> your plain address would reject every auto-forwarded digest — silently, since a rejection
+> is a log line, not a bounce. The `+tag` is stripped before matching, so one entry covers
+> both hand- and auto-forwarded mail.
 
-> **Gmail's auto-forward does not send as your own address.** It rewrites the envelope
-> sender to `youremail+caf_=usps=domainviases.tld@customdomain.tld`. An allow-list holding
-> only your plain address would reject every auto-forwarded digest — silently, since a
-> rejection is a log line, not a bounce. The `+tag` is stripped before matching so one
-> entry covers both hand- and auto-forwarded mail. If digests stop arriving, check the
-> logs for `rejecting: unrecognised forwarder` first.
-
-Setting `ALLOWED_FORWARDERS=*` disables the check and accepts anything. That is reasonable
-locally; in production it means the only thing between a stranger and a trusted email in
-your inbox is that they haven't guessed `SES_RECIPIENT`.
+A lone `ALLOWED_FORWARDERS=*` disables the check entirely. Anything else that resolves to no
+usable entry — a blank value, stray commas, `*` mixed with real entries — is a hard startup
+error rather than a silent disable, because turning the gate off should be deliberate.
 
 **Be clear about what this gate is and isn't.** It matches `Return-Path` — the SMTP envelope
 sender, which is *asserted* by whoever connects, not verified. So the allow-list raises the
 bar (an attacker must also learn `SES_RECIPIENT`) but it does **not** authenticate. Treat it
 as one layer, not as proof of origin.
 
-Authentication is available and this project does not yet use it. SES stamps an
-`Authentication-Results` header carrying `spf=`, `dkim=` and `dmarc=` results under its own
-`amazonses.com` authserv-id, and because SES prepends its trace headers, a forged copy in
-the message body sits below it and is never read. Two checks worth adding:
+Real authentication is available and **this project does not yet use it**. SES stamps an
+`Authentication-Results` header under its own `amazonses.com` authserv-id carrying `spf=`,
+`dkim=` and `dmarc=` results, and because SES prepends its trace headers, a forged copy in
+the message body sits below it and is never read. Two options, neither implemented:
 
-- **`spf=pass`, cross-checked against the header's own `envelope-from=`.** This authenticates
-  the *forwarder* — the thing the allow-list is trying to assert. Note SPF binds a domain,
-  not a mailbox: with a `@gmail.com` entry, `spf=pass` only means "some Gmail user".
-- **`dkim=pass` for USPS's own domain.** Stronger, and available on the auto-forward path:
-  a forward that preserves the message leaves USPS's signature intact, so SES verifies USPS
-  *cryptographically*, end to end. Forwarding by hand rewrites the body and breaks it, so
-  this check would reject hand-forwarded digests.
+| | **C — require `spf=pass`** | **D — require USPS `dkim=pass`** |
+|---|---|---|
+| Proves | The **forwarder** was authorised by the domain it claimed | The digest genuinely came from **USPS**, cryptographically |
+| Strength | Closes the forgery path | Stronger — forging needs USPS's private key |
+| Cost | SPF binds a *domain*, not a mailbox | **Rejects hand-forwarded mail** — a Forward button rewrites the body and breaks the signature |
+| Works with | Both forwarding styles | Auto-forward only; needs an escape hatch for manual tests |
+
+Either should run **log-only first** — record the verdict, change nothing, watch for a
+`WOULD-REJECT` line — and then fail closed once you trust it.
+
+See **[docs/authenticating-the-sender.md](docs/authenticating-the-sender.md)** for the full
+comparison, the header format, and the measurements behind this.
 
 ---
 
@@ -385,6 +407,7 @@ exists.
 | `chalicelib/render.py` | `Digest` → HTML + MIME assembly |
 | `tests/` | Regression tests pinned to the real corpus |
 | `tools/` | Dev + ops scripts: fixtures, local runs, S3 inspection, deploy |
+| `docs/` | [Stopping junk mail](docs/stopping-junk-mail.md) · [Authenticating the sender](docs/authenticating-the-sender.md) |
 
 ---
 
